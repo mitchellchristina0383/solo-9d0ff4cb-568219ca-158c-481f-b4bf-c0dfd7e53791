@@ -10,11 +10,17 @@ Covers the full acceptance story:
   7. upstream process lost -> connection errors handled; traffic resumes on recovery
   8. stale late results cannot overwrite newer breaker conclusions
 
+All /proxy calls are HMAC-signed (see app/signed_auth.py); every call uses a
+fresh nonce so the shared admission ledger never sees an accidental replay.
+
 Run:  python -I tests/test_integration.py
 """
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -26,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 UP = os.getenv("UP_BASE", "http://127.0.0.1:18000")
 GW = [os.getenv("GW1_BASE", "http://127.0.0.1:18001"),
       os.getenv("GW2_BASE", "http://127.0.0.1:18002")]
+
+CLIENT_ID = os.getenv("SIGNED_CLIENT_ID", "demo-client")
+CLIENT_SECRET = os.getenv("SIGNED_CLIENT_SECRET", "demo-secret-please-change")
 
 PASS, FAIL = 0, 0
 
@@ -40,10 +49,12 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-def req(method, url, body=None, timeout=10):
+def req(method, url, body=None, timeout=10, headers=None):
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(url, data=data, method=method,
-                               headers={"content-type": "application/json"})
+    hdrs = {"content-type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    r = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
             raw = resp.read().decode()
@@ -61,6 +72,31 @@ def req(method, url, body=None, timeout=10):
         return 0, {"error": repr(exc)}
 
 
+# --------------------------------------------------------------- signing
+def canonical(client_id, ts, nonce, method, target):
+    return "\n".join(["v1", client_id, str(ts), nonce, method.upper(), target])
+
+
+def sign_request(target="/proxy", *, client_id=CLIENT_ID, secret=CLIENT_SECRET,
+                 ts=None, nonce=None, method="GET"):
+    """Return (headers, meta).  A fresh nonce every call; pass nonce to replay."""
+    ts = int(time.time()) if ts is None else ts
+    nonce = nonce or secrets.token_hex(12)
+    message = canonical(client_id, ts, nonce, method, target)
+    sig = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return {
+        "X-Client-Id": client_id,
+        "X-Timestamp": str(ts),
+        "X-Nonce": nonce,
+        "X-Signature": sig,
+    }, {"target": target, "ts": ts, "nonce": nonce}
+
+
+def signed_get(which=0, timeout=10, target="/proxy", **kw):
+    headers, _meta = sign_request(target, **kw)
+    return req("GET", GW[which] + target, timeout=timeout, headers=headers)
+
+
 def set_mode(mode):
     status, body = req("POST", GW[0] + "/api/upstream/mode", {"mode": mode})
     assert status == 200, body
@@ -73,7 +109,8 @@ def state(which=0):
 
 
 def proxy(which=0, timeout=10):
-    return req("GET", GW[which] + "/proxy", timeout=timeout)
+    """Signed GET with a fresh nonce (the normal, accepted path)."""
+    return signed_get(which, timeout=timeout)
 
 
 def wait_state(expected, timeout=8, which=0):
@@ -95,10 +132,115 @@ def wait_port(url, timeout=10):
     return False
 
 
+def upstream_calls():
+    _, body = req("GET", UP + "/mode")
+    return body["calls"]
+
+
+def test_signed_entry():
+    print("== 0. signed entry admission ==")
+    set_mode("normal")
+    assert wait_state("CLOSED")
+
+    # Unsigned / anonymous probe of /proxy must be refused before upstream or
+    # breaker work, and must not consume an upstream call.
+    before = upstream_calls()
+    s, b = req("GET", GW[0] + "/proxy")
+    check("unsigned /proxy rejected 401", s == 401 and b["reason"] == "signature_required", str(b))
+    check("unsigned /proxy did not reach upstream", upstream_calls() == before)
+
+    # Rejected requests must not alter the breaker (e.g. count as a failure).
+    st_before = state()
+    req("GET", GW[0] + "/proxy")
+    check("unsigned reject leaves breaker untouched",
+          state()["failure_count"] == st_before["failure_count"]
+          and state()["state"] == st_before["state"])
+
+    # Valid signature, fresh nonce: accepted, one upstream call.
+    before = upstream_calls()
+    s, b = proxy(0)
+    check("valid signature forwards", s == 200 and b["outcome"] == "success", str(b))
+    check("valid signature used upstream exactly once", upstream_calls() == before + 1)
+
+    # Offered signature of a different client secret / tampered -> 401.
+    headers, _ = sign_request(secret="wrong-secret")
+    before = upstream_calls()
+    s, b = req("GET", GW[0] + "/proxy", headers=headers)
+    check("wrong secret -> invalid_signature", s == 401 and b["reason"] == "invalid_signature", str(b))
+    headers, _ = sign_request()
+    headers["X-Signature"] = ("0" if headers["X-Signature"][0] != "0" else "1") + headers["X-Signature"][1:]
+    s, b = req("GET", GW[0] + "/proxy", headers=headers)
+    check("tampered signature -> invalid_signature",
+          s == 401 and b["reason"] == "invalid_signature", str(b))
+    check("invalid signatures never reached upstream", upstream_calls() == before)
+
+    # The secret itself must not be required on the wire; only the headers.
+    check("no Authorization/secret header needed", "authorization" not in
+          {k.lower() for k in headers})
+
+    # Skew: >30 s in the past and in the future.
+    for label, delta in (("past", -60), ("future", +60)):
+        headers, _ = sign_request(ts=int(time.time()) + delta)
+        before = upstream_calls()
+        s, b = req("GET", GW[0] + "/proxy", headers=headers)
+        check(f"timestamp skew {label} rejected",
+              s == 401 and b["reason"] == "timestamp_skew", str(b))
+        check(f"skew {label} never reached upstream", upstream_calls() == before)
+
+    # Method and raw path/query are part of the signed canonical string.
+    headers, meta = sign_request(target="/proxy")
+    s, b = req("GET", GW[0] + "/proxy?x=1", headers=headers)
+    check("query string is signed (mismatch -> invalid_signature)",
+          s == 401 and b["reason"] == "invalid_signature", str(b))
+    headers, meta = sign_request(target="/proxy?demo=1")
+    s, b = req("GET", GW[0] + "/proxy?demo=1", headers=headers)
+    check("matching raw path+query forwards", s == 200, str(b))
+
+    # Replay of an already-used signature: rejected, no upstream call, and
+    # crucially it must not consume the breaker/probe state either.
+    headers, meta = sign_request(nonce="replay-nonce-e2e-0001")
+    s1, _ = req("GET", GW[0] + "/proxy", headers=headers)
+    check("first use of nonce accepted", s1 == 200)
+    st_before = state()
+    before = upstream_calls()
+    s2, b2 = req("GET", GW[1] + "/proxy", headers=headers, )
+    check("replay on peer gateway -> 409", s2 == 409 and b2["reason"] == "replay_detected", str(b2))
+    check("replay did not reach upstream", upstream_calls() == before)
+    check("replay left breaker state unchanged",
+          state()["state"] == st_before["state"]
+          and state()["failure_count"] == st_before["failure_count"])
+
+    # Same nonce concurrently delivered to both gateways: exactly one admission,
+    # the rest are replays (shared ledger is atomic across processes).
+    headers, meta = sign_request(nonce="replay-nonce-e2e-race")
+    n = 10
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        outcomes = list(pool.map(
+            lambda i: req("GET", GW[i % 2] + "/proxy", headers=headers), range(n)))
+    admitted = [o for o in outcomes if o[0] != 409]
+    replays = [o for o in outcomes if o[0] == 409 and o[1].get("reason") == "replay_detected"]
+    check("concurrent same nonce -> exactly one admission", len(admitted) == 1,
+          str([(c, b.get("reason")) for c, b in outcomes]))
+    check("concurrent same nonce -> others are replays", len(replays) == n - 1,
+          str([(c, b.get("reason")) for c, b in outcomes]))
+
+    # Distinct nonces concurrently: all admitted.
+    def fresh(i):
+        return proxy(i % 2)
+    before = upstream_calls()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        outcomes = list(pool.map(fresh, range(6)))
+    check("distinct nonces all admitted", all(c == 200 for c, _ in outcomes),
+          str([(c, b.get("reason")) for c, b in outcomes]))
+    check("distinct nonces used upstream once each", upstream_calls() == before + 6)
+
+
 def main():
     print("== wait for services ==")
     for url in [UP, *GW]:
         check(f"service up: {url}", wait_port(url))
+
+    test_signed_entry()
 
     print("== 1. normal forwarding ==")
     set_mode("normal")
@@ -225,12 +367,13 @@ def main():
         check("third failure opens breaker", s == 502 and wait_state("OPEN"), str(b))
         # restart upstream
         env = dict(os.environ)
-        env.setdefault("PYTHONPATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        env.setdefault("PYTHONPATH", repo_root)
         log = open(os.path.join(os.path.dirname(pidfile), "flaky-upstream.log"), "a")
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.upstream_app:app",
              "--host", "127.0.0.1", "--port", UP.rsplit(":", 1)[1]],
-            cwd=env["PYTHONPATH"], env=env, stdout=log, stderr=log,
+            cwd=repo_root, env=env, stdout=log, stderr=log,
         )
         with open(pidfile, "w") as f:
             f.write(str(proc.pid))
@@ -290,7 +433,7 @@ def main():
         g1 = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.gateway_app:app",
              "--host", "127.0.0.1", "--port", GW[0].rsplit(":", 1)[1]],
-            cwd=env["PYTHONPATH"], env=env, stdout=glog, stderr=glog,
+            cwd=repo_root, env=env, stdout=glog, stderr=glog,
         )
         with open(os.path.join(os.path.dirname(pidfile), "gateway-1.pid"), "w") as f:
             f.write(str(g1.pid))

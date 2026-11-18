@@ -5,7 +5,9 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# The compose build context is ./app, but the modules live in the ``app``
+# package (``from .breaker import ...``), so copy them into /srv/app.
+COPY . ./app/
 
 # Gateway uses 8000 inside the container; compose maps 8001/8002 on the host.
 EXPOSE 8000

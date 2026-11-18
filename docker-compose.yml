@@ -27,6 +27,13 @@ services:
       CB_FAILURE_THRESHOLD: "3"
       CB_COOLDOWN_SECONDS: "2"
       CB_PROBE_TIMEOUT_SECONDS: "3"
+      # HMAC clients allowed to call GET /proxy.  Secrets never travel on the
+      # wire; the browser demo client must use the same secret locally.
+      SIGNED_CLIENTS: '{"demo-client":"demo-secret-please-change"}'
+      SIGNED_MAX_SKEW_SECONDS: "30"
+      # Nonce ledger: defaults to CB_DB_PATH (same shared volume), override to
+      # point at another shared SQLite file if desired.
+      SIGNED_NONCE_TTL_SECONDS: "3600"
     ports:
       - "8001:8000"
     volumes:
@@ -46,6 +53,13 @@ services:
       CB_FAILURE_THRESHOLD: "3"
       CB_COOLDOWN_SECONDS: "2"
       CB_PROBE_TIMEOUT_SECONDS: "3"
+      # HMAC clients allowed to call GET /proxy.  Secrets never travel on the
+      # wire; the browser demo client must use the same secret locally.
+      SIGNED_CLIENTS: '{"demo-client":"demo-secret-please-change"}'
+      SIGNED_MAX_SKEW_SECONDS: "30"
+      # Nonce ledger: defaults to CB_DB_PATH (same shared volume), override to
+      # point at another shared SQLite file if desired.
+      SIGNED_NONCE_TTL_SECONDS: "3600"
     ports:
       - "8002:8000"
     volumes:

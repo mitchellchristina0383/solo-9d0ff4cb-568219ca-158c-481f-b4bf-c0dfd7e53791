@@ -17,6 +17,9 @@ export CB_DB_PATH="$PWD/data/breaker.db"
 export CB_FAILURE_THRESHOLD=3
 export CB_COOLDOWN_SECONDS=2
 export CB_PROBE_TIMEOUT_SECONDS=3
+export SIGNED_CLIENTS='{"demo-client":"demo-secret-please-change"}'
+export SIGNED_MAX_SKEW_SECONDS=30
+export SIGNED_NONCE_TTL_SECONDS=3600
 
 start() {
   local name="$1" app="$2" port="$3" extra="$4"
